@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#
+# ./install — single entry point for the Paseo role pack installers.
+#
+# Run directly (no `node` needed):
+#   ./install                 # interactive prompt (codex / pi / claude / all)
+#   ./install pi              # Pi role pack only
+#   ./install codex           # Codex role pack only
+#   ./install claude          # Claude Code role pack only
+#   ./install all             # all three, Codex first (stops on first failure)
+#   ./install pi --dry-run    # preview only, write nothing
+#   ./install all --force     # overwrite differing files (backs up first)
+#   ./install --help
+#
+# The cross-platform Node dispatcher owns argument parsing and invokes the
+# role-pack installers. `install.ps1` and `install.cmd` use the same dispatcher
+# on Windows.
+
+script_path="${BASH_SOURCE[0]:-$0}"
+dir="$(cd "$(dirname "$(realpath -m "$script_path" 2>/dev/null || echo "$script_path")")" && pwd)"
+exec node "$dir/scripts/install.mjs" "$@"

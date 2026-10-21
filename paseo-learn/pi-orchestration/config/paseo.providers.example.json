@@ -1,0 +1,27 @@
+{
+  "$schema": "https://paseo.sh/schemas/paseo.config.v1.json",
+  "version": 1,
+  "daemon": { "mcp": { "enabled": true, "injectIntoAgents": true } },
+  "agents": {
+    "providers": {
+      "pi-lead": {
+        "extends": "pi", "label": "Pi Lead",
+        "description": "SLP orchestration owner. Full agent-scoped Paseo MCP.",
+        "command": ["__PASEO_HOME__/bin/pi-role-app-server"],
+        "env": { "PI_CODING_AGENT_DIR": "__PI_ROLES_HOME__/lead", "PASEO_PI_ROLE": "lead", "PASEO_MCP_ACCESS": "lead" }
+      },
+      "pi-peer": {
+        "extends": "pi", "label": "Pi Peer",
+        "description": "One bounded Peer assignment. No Paseo MCP; V3 disposition + mode bind authority.",
+        "command": ["pi"],
+        "env": { "PI_CODING_AGENT_DIR": "__PI_ROLES_HOME__/peer", "PASEO_PI_ROLE": "peer" }
+      },
+      "pi-supervisor": {
+        "extends": "pi", "label": "Pi Supervisor",
+        "description": "Governance observer with a minimal recovery-gated Paseo MCP allowlist.",
+        "command": ["__PASEO_HOME__/bin/pi-role-app-server"],
+        "env": { "PI_CODING_AGENT_DIR": "__PI_ROLES_HOME__/supervisor", "PASEO_PI_ROLE": "supervisor", "PASEO_MCP_ACCESS": "supervisor" }
+      }
+    }
+  }
+}

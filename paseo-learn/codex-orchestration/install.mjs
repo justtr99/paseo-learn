@@ -1,0 +1,448 @@
+#!/usr/bin/env node
+
+import {
+	chmod,
+	copyFile,
+	lstat,
+	mkdir,
+	readFile,
+	readlink,
+	rename,
+	rm,
+	stat,
+	symlink,
+	writeFile,
+} from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const args = new Set(process.argv.slice(2));
+const dryRun = args.has("--dry-run");
+const force = args.has("--force");
+const allowedArgs = new Set(["--dry-run", "--force"]);
+const unknown = [...args].filter((arg) => !allowedArgs.has(arg));
+
+if (unknown.length) {
+	console.error(`Unknown option(s): ${unknown.join(", ")}`);
+	console.error("Usage: node codex-orchestration/install.mjs [--dry-run] [--force]");
+	process.exit(2);
+}
+
+// This installer lives inside codex-orchestration/, so the pack root is its own
+// directory and profiles/ + bin/ sit next to it.
+const packRoot = path.dirname(fileURLToPath(import.meta.url));
+const sourceProfiles = path.join(packRoot, "profiles");
+const windowsLauncher = process.platform === "win32";
+const launcherName = windowsLauncher
+	? "codex-role-app-server.mjs"
+	: "codex-role-app-server";
+const sourceLauncher = path.join(packRoot, "bin", launcherName);
+const sourcePolicy = path.join(packRoot, "shared", "paseo-team-policy");
+const sourcePolicyManifest = path.join(sourcePolicy, "hooks.json");
+const codexHome = path.resolve(
+	process.env.CODEX_HOME || path.join(homedir(), ".codex"),
+);
+const paseoHome = path.resolve(
+	process.env.PASEO_HOME || path.join(homedir(), ".paseo"),
+);
+const rolesHome = path.resolve(
+	process.env.PASEO_CODEX_ROLES_HOME ||
+		path.join(homedir(), ".codex-paseo"),
+);
+const paseoBin = path.join(paseoHome, "bin");
+const targetLauncher = path.join(paseoBin, launcherName);
+const paseoConfigPath = path.join(paseoHome, "config.json");
+const preferencesPath = path.join(
+	paseoHome,
+	"orchestration-preferences.json",
+);
+const stamp = new Date().toISOString().replaceAll(/[:.]/g, "-");
+
+const profileNames = ["paseo-lead", "paseo-peer", "paseo-supervisor"];
+const retiredRoles = ["worker", "reviewer"];
+
+const roleByProfile = {
+	"paseo-lead": "lead",
+	"paseo-peer": "peer",
+	"paseo-supervisor": "supervisor",
+};
+
+function providerConfig() {
+	const launcherCommand = windowsLauncher
+		? [process.execPath, targetLauncher]
+		: [targetLauncher];
+	return {
+		"codex-lead": {
+			extends: "codex",
+			label: "Codex Lead",
+			description:
+				"Full-access orchestration owner governed by developer instructions",
+			command: launcherCommand,
+			env: {
+				CODEX_HOME: path.join(rolesHome, "lead"),
+				PASEO_MCP_ACCESS: "lead",
+				PASEO_CODEX_ROLE: "lead",
+			},
+		},
+		"codex-peer": {
+			extends: "codex",
+			label: "Codex Peer",
+			description:
+				"One bounded Peer assignment; V3 disposition plus mode control mutation authority",
+			command: ["codex"],
+			env: { CODEX_HOME: path.join(rolesHome, "peer"), PASEO_CODEX_ROLE: "peer" },
+		},
+		"codex-supervisor": {
+			extends: "codex",
+			label: "Codex Supervisor",
+			description:
+				"Full-access governance observer with instruction-gated recovery",
+			command: launcherCommand,
+			env: {
+				CODEX_HOME: path.join(rolesHome, "supervisor"),
+				PASEO_MCP_ACCESS: "supervisor",
+				PASEO_CODEX_ROLE: "supervisor",
+			},
+		},
+	};
+}
+
+const obsoletePreferences = [
+	"Use only the role-gated `paseo-team` facade for orchestration. Do not call raw `paseo`, MCP, native subagents, or a private task database.",
+	"Agent Profiles remain Human launch presets; CLI orchestration does not infer routes from them. Discover provider/model/thinking availability with `paseo-team providers` and `paseo-team models`, pin every value on `paseo-team run`, and post-verify with `paseo-team inspect`. Never silently fall back.",
+	"Use the current Paseo workspace by default. Never create a new workspace or worktree unless the Human explicitly requests it. Keep at most one active writer in a shared workspace. Do not use codex-supervisor in ordinary single-task flows.",
+];
+
+const defaultPreferences = {
+	providers: {
+		impl: "codex-peer/gpt-5.6-luna",
+		ui: "codex-peer/gpt-5.6-luna",
+		research: "codex-peer/gpt-5.6-luna",
+		planning: "codex-lead/gpt-5.6-sol",
+		audit: "codex-peer/gpt-5.6-luna",
+	},
+	preferences: [
+		"Use codex-lead for topology and acceptance, and codex-peer for one bounded disposition: engineer writes only with valid V3 scope; scout/architect/reviewer/shadow are read-only. No Beads or substitute tracker is active; assignments and handbacks in Paseo messages are work state.",
+		"Use Vietnamese for every user-facing response and every agent-to-agent prompt, message, report, review, and handoff. Preserve code, commands, paths, identifiers, protocol fields, quoted logs/errors, and machine-readable tokens. A specific explicit Human language request overrides this only for that output.",
+		"Same-family routing is mandatory by default: a Codex Lead routes to codex-* role providers. Use pi-* or claude-* only when the Human explicitly requests that provider family for the delegation. If the required Codex role is unavailable, block and ask; profile availability or model ranking never authorizes cross-family substitution.",
+		"When list_profiles is available, treat a complete profile whose provider matches the chosen codex role as a human-authored route candidate. Notes are advisory; validate model, thinking, mode, and features through discovery, copy the fields into create_agent, and post-verify runtime state. Never silently repair a stale profile.",
+		"For every Peer disposition, use codex-peer/gpt-5.6-luna with thinkingOptionId max unless the validated Human route says otherwise. Route never grants authority.",
+		"Discover provider/model availability on the target Paseo daemon before creating an agent. Never silently fall back.",
+		"Every subagent must inherit the Lead current workspace. Never pass workspace placement, call create_workspace, or run manual git worktree commands. Serialize engineer Peer and reviewer Peer; keep at most one active writer. Do not use codex-supervisor in ordinary single-task flows."
+	],
+};
+
+async function retireOwnedFile(target, label) {
+	if (!(await exists(target))) return;
+	if (!force) {
+		throw new Error(`Obsolete managed ${label} still exists at ${target}; rerun with --force after review`);
+	}
+	await backup(target);
+	if (!dryRun) await rm(target, { force: true });
+	console.log(`${dryRun ? "would remove" : "removed"}: ${target} (${label})`);
+}
+
+async function readJsonOr(pathname, fallback) {
+	try {
+		return JSON.parse(await readFile(pathname, "utf8"));
+	} catch (error) {
+		if (error?.code === "ENOENT") return structuredClone(fallback);
+		throw new Error(`Cannot parse ${pathname}: ${error.message}`);
+	}
+}
+
+async function exists(pathname) {
+	try {
+		await stat(pathname);
+		return true;
+	} catch (error) {
+		if (error?.code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+async function backup(pathname) {
+	if (!(await exists(pathname))) return null;
+	const target = `${pathname}.bak.${stamp}`;
+	if (!dryRun) await copyFile(pathname, target, fsConstants.COPYFILE_EXCL);
+	console.log(`${dryRun ? "would backup" : "backup"}: ${target}`);
+	return target;
+}
+
+async function assertSafeTarget(target) {
+	try {
+		const info = await lstat(target);
+		if (info.isSymbolicLink()) throw new Error(`Refusing to write through symlink target ${target}`);
+	} catch (error) {
+		if (error?.code !== "ENOENT") throw error;
+	}
+}
+
+async function installOwnedText(sourceText, target, mode) {
+	await assertSafeTarget(target);
+	if (await exists(target)) {
+		const targetText = await readFile(target, "utf8");
+		if (targetText === sourceText) {
+			console.log(`unchanged: ${target}`);
+			if (!dryRun && mode) await chmod(target, mode);
+			return;
+		}
+		if (!force) {
+			throw new Error(
+				`Refusing to overwrite ${target}; rerun with --force after review`,
+			);
+		}
+		await backup(target);
+	}
+	if (!dryRun) {
+		await mkdir(path.dirname(target), { recursive: true });
+		await writeFile(target, sourceText, { encoding: "utf8" });
+		if (mode) await chmod(target, mode);
+	}
+	console.log(`${dryRun ? "would install" : "installed"}: ${target}`);
+}
+
+async function installOwnedFile(source, target, mode) {
+	await installOwnedText(await readFile(source, "utf8"), target, mode);
+}
+
+async function installHookManifest(roleHome) {
+	const manifest = JSON.parse(await readFile(sourcePolicyManifest, "utf8"));
+	const hooks = manifest?.hooks ?? {};
+	for (const [event, file] of [["PreToolUse", "pre-tool-use.mjs"], ["UserPromptSubmit", "user-prompt-submit.mjs"]]) {
+		for (const registration of hooks[event] ?? []) {
+			for (const hook of registration.hooks ?? []) {
+				hook.command = `node "${path.join(roleHome, "hooks", file)}"`;
+			}
+		}
+	}
+	await installOwnedText(
+		`${JSON.stringify(manifest, null, 2)}\n`,
+		path.join(roleHome, "hooks.json"),
+		0o600,
+	);
+}
+
+function splitProjectTrustTail(text) {
+	const lines = text.split("\n");
+	const projectIndex = lines.findIndex((line) => /^\[projects\./.test(line));
+	if (projectIndex === -1) {
+		return { owned: text, projectTrust: "" };
+	}
+	return {
+		owned: `${lines.slice(0, projectIndex).join("\n").trimEnd()}\n`,
+		projectTrust: `${lines.slice(projectIndex).join("\n").trimEnd()}\n`,
+	};
+}
+
+async function installRoleConfig(source, target) {
+	await assertSafeTarget(target);
+	const sourceText = await readFile(source, "utf8");
+	let projectTrust = "";
+	if (await exists(target)) {
+		const targetText = await readFile(target, "utf8");
+		const split = splitProjectTrustTail(targetText);
+		projectTrust = split.projectTrust;
+		if (split.owned === sourceText) {
+			console.log(
+				`unchanged: ${target}${projectTrust ? " (preserved local project trust)" : ""}`,
+			);
+			return;
+		}
+		if (!force) {
+			throw new Error(
+				`Refusing to overwrite ${target}; rerun with --force after review`,
+			);
+		}
+		await backup(target);
+	}
+	const desired = projectTrust
+		? `${sourceText.trimEnd()}\n\n${projectTrust}`
+		: sourceText;
+	if (!dryRun) {
+		await mkdir(path.dirname(target), { recursive: true });
+		await writeFile(target, desired, { encoding: "utf8", mode: 0o600 });
+	}
+	console.log(
+		`${dryRun ? "would install" : "installed"}: ${target}${projectTrust ? " (preserved local project trust)" : ""}`,
+	);
+}
+
+async function installOwnedDir(source, target) {
+	try {
+		const info = await lstat(target);
+		if (info.isSymbolicLink()) throw new Error(`Refusing to write through symlink directory ${target}`);
+	} catch (error) {
+		if (error?.code !== "ENOENT") throw error;
+	}
+	for (const entry of await (await import("node:fs/promises")).readdir(source, { withFileTypes: true })) {
+		if (entry.isFile() && entry.name !== "hooks.json") await installOwnedFile(path.join(source, entry.name), path.join(target, entry.name), entry.name.endsWith(".mjs") ? 0o755 : undefined);
+	}
+}
+
+async function installAuthLink(roleHome) {
+	const source = path.join(codexHome, "auth.json");
+	const target = path.join(roleHome, "auth.json");
+	if (!(await exists(source))) {
+		console.log(`auth not linked (run codex login first): ${source}`);
+		return;
+	}
+	try {
+		const info = await lstat(target);
+		if (info.isSymbolicLink()) {
+			const link = await readlink(target);
+			if (path.resolve(roleHome, link) === source) {
+				console.log(`unchanged: ${target} -> ${source}`);
+				return;
+			}
+		}
+		throw new Error(
+			`Refusing to replace existing role auth path ${target}; inspect it manually`,
+		);
+	} catch (error) {
+		if (error?.code !== "ENOENT") throw error;
+	}
+	let copiedCredential = false;
+	if (!dryRun) {
+		await mkdir(roleHome, { recursive: true });
+		try {
+			await symlink(source, target);
+		} catch (error) {
+			// Windows commonly blocks unprivileged symbolic-link creation unless
+			// Developer Mode is enabled. A private copy keeps the role runnable;
+			// re-run the installer after a later `codex login` to refresh it.
+			if (process.platform !== "win32" || error?.code !== "EPERM") throw error;
+			await copyFile(source, target);
+			await chmod(target, 0o600);
+			copiedCredential = true;
+		}
+	}
+	if (copiedCredential) {
+		console.warn(`copied credential (Windows symbolic links are unavailable): ${target}. Re-run this installer after \`codex login\` to refresh it.`);
+	} else {
+		console.log(`${dryRun ? "would link" : "linked"}: ${target} -> ${source}`);
+	}
+}
+
+async function writeJsonAtomic(pathname, value) {
+	await assertSafeTarget(pathname);
+	const text = `${JSON.stringify(value, null, 2)}\n`;
+	if (await exists(pathname)) {
+		const current = await readFile(pathname, "utf8");
+		if (current === text) {
+			console.log(`unchanged: ${pathname}`);
+			return;
+		}
+		await backup(pathname);
+	}
+	if (!dryRun) {
+		await mkdir(path.dirname(pathname), { recursive: true });
+		const temp = `${pathname}.tmp.${process.pid}`;
+		try {
+			await writeFile(temp, text, { encoding: "utf8", mode: 0o600, flag: "wx" });
+		} catch (error) {
+			if (error?.code === "EEXIST") throw new Error(`Refusing to reuse existing atomic temp file ${temp}`);
+			throw error;
+		}
+		await rename(temp, pathname);
+	}
+	console.log(`${dryRun ? "would update" : "updated"}: ${pathname}`);
+}
+
+function retireLegacySLPProviders(config) {
+	const providers = config.agents?.providers ?? {};
+	const present = retiredRoles.filter((role) => providers[`codex-${role}`]);
+	if (present.length && !force) {
+		throw new Error(
+			"Legacy Worker/Reviewer providers found; rerun with --force to migrate to the three-role SLP topology",
+		);
+	}
+	for (const role of retiredRoles) delete providers[`codex-${role}`];
+}
+
+async function main() {
+	for (const profile of profileNames) {
+		const source = path.join(sourceProfiles, `${profile}.config.toml`);
+		await installOwnedFile(
+			source,
+			path.join(codexHome, `${profile}.config.toml`),
+		);
+		const roleHome = path.join(rolesHome, roleByProfile[profile]);
+		await installRoleConfig(source, path.join(roleHome, "config.toml"));
+		await installAuthLink(roleHome);
+		await installHookManifest(roleHome);
+		await installOwnedDir(sourcePolicy, path.join(roleHome, "hooks"));
+	}
+	await installOwnedFile(sourceLauncher, targetLauncher, 0o755);
+	await retireOwnedFile(path.join(paseoBin, "paseo-team"), "CLI-era orchestration facade");
+	await retireOwnedFile(path.join(paseoBin, "paseo-team.cmd"), "CLI-era orchestration launcher");
+
+	const config = await readJsonOr(paseoConfigPath, {
+		$schema: "https://paseo.sh/schemas/paseo.config.v1.json",
+		version: 1,
+	});
+	config.version ??= 1;
+	config.daemon ??= {};
+	config.daemon.mcp ??= {};
+	config.daemon.mcp.enabled = true;
+	config.daemon.mcp.injectIntoAgents = true;
+	config.agents ??= {};
+	config.agents.providers ??= {};
+	retireLegacySLPProviders(config);
+
+	for (const [id, desired] of Object.entries(providerConfig())) {
+		const current = config.agents.providers[id];
+		if (
+			current &&
+			JSON.stringify(current) !== JSON.stringify(desired) &&
+			!force
+		) {
+			throw new Error(
+				`Provider ${id} already exists with different config; use --force after review`,
+			);
+		}
+		config.agents.providers[id] = desired;
+	}
+	await writeJsonAtomic(paseoConfigPath, config);
+
+	const preferences = await readJsonOr(preferencesPath, {
+		providers: {},
+		preferences: [],
+	});
+	preferences.providers ??= {};
+	preferences.preferences ??= [];
+	preferences.preferences = preferences.preferences.filter(
+		(preference) => !obsoletePreferences.includes(preference),
+	);
+	for (const [category, provider] of Object.entries(
+		defaultPreferences.providers,
+	)) {
+		preferences.providers[category] ??= provider;
+	}
+	for (const preference of defaultPreferences.preferences) {
+		if (!preferences.preferences.includes(preference)) {
+			preferences.preferences.push(preference);
+		}
+	}
+	await writeJsonAtomic(preferencesPath, preferences);
+
+	console.log("");
+	console.log(
+		dryRun
+			? "Dry run complete; no files were changed."
+			: "Profiles installed. Paseo daemon was NOT restarted.",
+	);
+	console.log("Finish active agents before refreshing/restarting Paseo.");
+	console.log("Then verify with: paseo provider ls --json");
+	console.log("And: paseo provider models codex-lead --json");
+	console.log(
+		"Then create host Agent Profiles in Settings → Host → Agents; this installer preserves daemon.agentProfiles.",
+	);
+}
+
+main().catch((error) => {
+	console.error(`codex-orchestration install: ${error.message}`);
+	process.exit(1);
+});
