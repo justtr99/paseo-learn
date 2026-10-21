@@ -7,7 +7,10 @@ import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
-const command = "codex";
+// Paseo's daemon can have a smaller PATH than the PowerShell session that ran
+// the installer. On Windows, the installer pins the discovered npm .cmd shim.
+const configuredCommand = process.env.PASEO_CODEX_COMMAND?.trim();
+const command = configuredCommand || resolveCommand("codex");
 const args = process.argv.slice(2);
 const codexHome = path.resolve(process.env.CODEX_HOME || path.join(process.env.USERPROFILE || process.env.HOME || "", ".codex"));
 const agentId = process.env.PASEO_AGENT_ID;
@@ -27,8 +30,23 @@ function isWithin(root, candidate) {
 	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 }
 
+function resolveCommand(binary) {
+	if (process.platform !== "win32") return binary;
+	const extensions = (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";");
+	for (const directory of (process.env.PATH || "").split(path.delimiter)) {
+		for (const extension of extensions) {
+			const candidate = path.join(directory, `${binary}${extension}`);
+			if (existsSync(candidate)) return candidate;
+		}
+	}
+	return binary;
+}
+
 if (!existsSync(codexHome) || !statSync(codexHome).isDirectory()) {
 	fail(`CODEX_HOME does not exist: ${codexHome}`);
+}
+if (configuredCommand && !existsSync(command)) {
+	fail(`configured Codex command does not exist: ${command}`, 127);
 }
 if (scoped && (isWithin(codexHome, workspace) || isWithin(workspace, codexHome))) {
 	fail(`workspace and CODEX_HOME must not overlap (workspace=${workspace}, CODEX_HOME=${codexHome})`);
@@ -51,6 +69,17 @@ if (access === "lead" || access === "supervisor") {
 	fail("unsupported PASEO_MCP_ACCESS role");
 }
 
-const result = spawnSync(command, [...codexArgs, ...args], { stdio: "inherit" });
-if (result.error) fail(`${command} is not on PATH`, 127);
+const result = spawnSync(command, [...codexArgs, ...args], {
+	stdio: "inherit",
+	// npm's Windows launcher is a .cmd script, which Node must run via cmd.exe.
+	shell: process.platform === "win32" && /\.(?:cmd|bat)$/i.test(command),
+});
+if (result.error) {
+	fail(
+		configuredCommand
+			? `cannot start configured Codex command: ${command}`
+			: `${command} is not on PATH`,
+		127,
+	);
+}
 process.exit(result.status ?? 1);

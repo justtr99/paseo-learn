@@ -24,6 +24,10 @@ node test/active-policy.test.mjs
 `--force` migrates managed legacy `pi-worker`/`pi-reviewer` provider/profile
 state. Old role homes are intentionally left inert.
 
+On Windows, the installer records the absolute `pi.cmd` npm shim in each Pi
+provider. This avoids relying on the smaller `PATH` of the Paseo daemon; rerun
+`.\install.ps1 pi --force` after reinstalling Pi to refresh that path.
+
 Uninstall is dry-run by default:
 
 ```bash

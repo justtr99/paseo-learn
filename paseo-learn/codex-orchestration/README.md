@@ -23,6 +23,10 @@ node test/codex-policy.test.mjs
 `--force` migrates managed legacy `codex-worker`/`codex-reviewer` providers.
 Old role homes/config files remain inert.
 
+On Windows, the installer records the absolute `codex.cmd` npm shim for every
+role, so Paseo's daemon does not need to inherit PowerShell's `PATH`. Run
+`.\install.ps1 codex --force` again after reinstalling Codex to refresh it.
+
 Uninstall is dry-run by default:
 
 ```bash

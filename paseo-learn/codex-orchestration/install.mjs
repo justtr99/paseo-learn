@@ -3,6 +3,7 @@
 import {
 	chmod,
 	copyFile,
+	access,
 	lstat,
 	mkdir,
 	readFile,
@@ -69,10 +70,17 @@ const roleByProfile = {
 	"paseo-supervisor": "supervisor",
 };
 
-function providerConfig() {
+function providerConfig(codexCommand) {
 	const launcherCommand = windowsLauncher
 		? [process.execPath, targetLauncher]
 		: [targetLauncher];
+	const env = (role) => ({
+		CODEX_HOME: path.join(rolesHome, role),
+		PASEO_CODEX_ROLE: role,
+		...(windowsLauncher && codexCommand
+			? { PASEO_CODEX_COMMAND: codexCommand }
+			: {}),
+	});
 	return {
 		"codex-lead": {
 			extends: "codex",
@@ -81,9 +89,8 @@ function providerConfig() {
 				"Full-access orchestration owner governed by developer instructions",
 			command: launcherCommand,
 			env: {
-				CODEX_HOME: path.join(rolesHome, "lead"),
+				...env("lead"),
 				PASEO_MCP_ACCESS: "lead",
-				PASEO_CODEX_ROLE: "lead",
 			},
 		},
 		"codex-peer": {
@@ -91,8 +98,10 @@ function providerConfig() {
 			label: "Codex Peer",
 			description:
 				"One bounded Peer assignment; V3 disposition plus mode control mutation authority",
-			command: ["codex"],
-			env: { CODEX_HOME: path.join(rolesHome, "peer"), PASEO_CODEX_ROLE: "peer" },
+			// The Windows launcher also pins the npm shim for Peer. With no
+			// PASEO_MCP_ACCESS it does not add an MCP surface.
+			command: windowsLauncher ? launcherCommand : ["codex"],
+			env: env("peer"),
 		},
 		"codex-supervisor": {
 			extends: "codex",
@@ -101,9 +110,8 @@ function providerConfig() {
 				"Full-access governance observer with instruction-gated recovery",
 			command: launcherCommand,
 			env: {
-				CODEX_HOME: path.join(rolesHome, "supervisor"),
+				...env("supervisor"),
 				PASEO_MCP_ACCESS: "supervisor",
-				PASEO_CODEX_ROLE: "supervisor",
 			},
 		},
 	};
@@ -298,9 +306,22 @@ async function installAuthLink(roleHome) {
 				return;
 			}
 		}
+		if (process.platform === "win32" && info.isFile()) {
+			const [current, desired] = await Promise.all([readFile(target), readFile(source)]);
+			if (current.equals(desired)) {
+				console.log(`unchanged: ${target} (Windows credential copy)`);
+				return;
+			}
+			if (!force) {
+				throw new Error(`Refusing to replace existing role auth path ${target}; rerun with --force after review`);
+			}
+			await backup(target);
+			if (!dryRun) await rm(target, { force: true });
+		} else {
 		throw new Error(
 			`Refusing to replace existing role auth path ${target}; inspect it manually`,
 		);
+		}
 	} catch (error) {
 		if (error?.code !== "ENOENT") throw error;
 	}
@@ -324,6 +345,26 @@ async function installAuthLink(roleHome) {
 	} else {
 		console.log(`${dryRun ? "would link" : "linked"}: ${target} -> ${source}`);
 	}
+}
+
+/** Resolve an executable without relying on the daemon's later PATH. */
+async function which(bin) {
+	const paths = (process.env.PATH || "").split(path.delimiter);
+	const extensions = process.platform === "win32"
+		? (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";")
+		: [""];
+	for (const directory of paths) {
+		for (const extension of extensions) {
+			const candidate = path.join(directory, `${bin}${extension}`);
+			try {
+				await access(candidate, fsConstants.X_OK);
+				return candidate;
+			} catch {
+				// Continue through PATH and executable extensions.
+			}
+		}
+	}
+	return "";
 }
 
 async function writeJsonAtomic(pathname, value) {
@@ -392,7 +433,11 @@ async function main() {
 	config.agents.providers ??= {};
 	retireLegacySLPProviders(config);
 
-	for (const [id, desired] of Object.entries(providerConfig())) {
+	const codexCommand = windowsLauncher ? await which("codex") : "";
+	if (windowsLauncher && !codexCommand) {
+		console.warn("warning: codex is not on PATH; providers will still require it at runtime");
+	}
+	for (const [id, desired] of Object.entries(providerConfig(codexCommand))) {
 		const current = config.agents.providers[id];
 		if (
 			current &&

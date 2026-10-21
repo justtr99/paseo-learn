@@ -13,9 +13,9 @@
  *     are symlinked from ~/.pi/agent so every role shares auth and the
  *     pi-mcp-adapter package, while keeping role resources isolated;
  *   - the launcher pi-role-app-server is copied to ~/.paseo/bin;
- *   - four providers (pi-lead/worker/reviewer/supervisor) are merged into
+ *   - three providers (pi-lead/peer/supervisor) are merged into
  *     ~/.paseo/config.json with daemon.mcp.injectIntoAgents=true;
- *   - four namespaced Agent Profiles are merged without replacing Human-owned
+ *   - three namespaced Agent Profiles are merged without replacing Human-owned
  *     entries; they pin the first/default model advertised by the live Pi
  *     catalog and fail closed on managed-profile conflicts unless --force;
  *   - ~/.paseo/orchestration-preferences.json is merged as fallback routing.
@@ -287,13 +287,17 @@ function retireLegacySLP(config) {
 	for (const role of retiredRoles) delete providers[`pi-${role}`];
 }
 
-function providerConfig() {
+function providerConfig(piCommand) {
 	const launcherCommand = windowsLauncher
 		? [process.execPath, targetLauncher]
 		: [targetLauncher];
 	const env = (role) => ({
 		PI_CODING_AGENT_DIR: path.join(rolesHome, role),
 		PASEO_PI_ROLE: role,
+		// Desktop-managed daemons commonly have a smaller PATH than the
+		// PowerShell session that runs this installer. Keep the Pi npm shim
+		// explicit on Windows; Unix keeps its normal command lookup.
+		...(windowsLauncher && piCommand ? { PASEO_PI_COMMAND: piCommand } : {}),
 	});
 	return {
 		"pi-lead": {
@@ -309,7 +313,9 @@ function providerConfig() {
 			label: "Pi Peer",
 			description:
 				"One bounded Peer assignment. No Paseo MCP; V3 disposition plus mode control mutation authority.",
-			command: ["pi"],
+			// On Windows use the same launcher so Peer receives the pinned npm
+			// shim too. It has no MCP access, so this does not widen authority.
+			command: windowsLauncher ? launcherCommand : ["pi"],
 			env: env("peer"),
 		},
 		"pi-supervisor": {
@@ -634,7 +640,7 @@ async function which(bin) {
 	return "";
 }
 
-async function preparePaseoConfig(profiles) {
+async function preparePaseoConfig(profiles, piCommand) {
 	const config = await readJsonOr(paseoConfigPath, {
 		$schema: "https://paseo.sh/schemas/paseo.config.v1.json",
 		version: 1,
@@ -648,7 +654,7 @@ async function preparePaseoConfig(profiles) {
 	config.agents ??= {};
 	config.agents.providers ??= {};
 	retireLegacySLP(config);
-	for (const [id, desired] of Object.entries(providerConfig())) {
+	for (const [id, desired] of Object.entries(providerConfig(piCommand))) {
 		const current = config.agents.providers[id];
 		if (
 			current &&
@@ -674,7 +680,8 @@ async function main() {
 	assertAgentProfilesPaseoVersion();
 	const profileRoutes = discoverAgentProfileRoutes();
 	const profiles = managedAgentProfiles(profileRoutes);
-	const config = await preparePaseoConfig(profiles);
+	const piCommand = windowsLauncher ? await which("pi") : "";
+	const config = await preparePaseoConfig(profiles, piCommand);
 	console.log("Agent Profiles: Pi role routes");
 	for (const role of roles) {
 		console.log(
